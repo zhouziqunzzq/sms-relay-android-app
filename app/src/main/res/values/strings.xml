@@ -1,3 +1,14 @@
 <resources>
     <string name="app_name">SMS Relay</string>
+    <string name="login_success">You have logged in successfully.</string>
+    <string name="login_error">Login Error</string>
+    <string name="login_success_title">Login Success</string>
+    <string name="login_profile_placeholder">Log in to see user profile</string>
+    <string name="sim_phone_numbers_label">SIM Phone Numbers</string>
+    <string name="sim_phone_numbers_placeholder">(SIM phone numbers will appear here)</string>
+    <string name="sim_permission_denied">Permission denied. Cannot read SIM phone numbers.</string>
+    <string name="no_sim_cards">No SIM cards detected or permission denied.</string>
+    <string name="failed_parse_user_profile">Failed to parse user profile.</string>
+    <string name="logout">Logout</string>
+    <string name="login">Login</string>
 </resources>
