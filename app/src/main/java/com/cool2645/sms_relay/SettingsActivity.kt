@@ -15,8 +15,10 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
+import com.cool2645.sms_relay.models.LoginRequest
+import com.cool2645.sms_relay.models.LoginResponse
+import com.cool2645.sms_relay.models.User
+import com.cool2645.sms_relay.utils.SecurePrefsManager
 import com.google.gson.Gson
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,22 +29,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 class SettingsActivity : AppCompatActivity() {
-    data class User(
-        val id: String?,
-        val username: String?,
-        val user_type: String?,
-        val name: String?,
-        val device_id: String?,
-        val email: String?,
-        val created_at: String?,
-        val updated_at: String?
-    )
-    data class LoginResponse(
-        val user: User?,
-        val token: String?,
-        val token_expire_after: String?
-    )
-    data class LoginRequest(val username: String, val password: String)
 
     companion object {
         private const val REQUEST_CODE_PHONE_PERMISSIONS = 1001
@@ -52,63 +38,83 @@ class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_settings)
+
         // Request notification permission for Android 13+
         if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_CODE_NOTIFICATION_PERMISSION)
         }
-        // Initialize EncryptedSharedPreferences
-        val masterKey = MasterKey.Builder(this)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        val encryptedPrefs = EncryptedSharedPreferences.create(
-            this,
-            "secure_prefs",
-            masterKey,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        )
+
+        initializeViews()
+        loadSavedCredentials()
+        setupButtonListeners()
+        checkAndLoadPhoneNumbers()
+    }
+
+    /**
+     * Initialize UI components and load saved data
+     */
+    private fun initializeViews() {
+        val userProfileTextView = findViewById<TextView>(R.id.userProfileTextView)
+        val savedToken = SecurePrefsManager.getToken(this)
+
+        // Try to load user profile if token is present
+        if (!savedToken.isNullOrEmpty()) {
+            val (username, password) = SecurePrefsManager.getCredentials(this)
+            fetchUserProfile(
+                token = savedToken,
+                userProfileTextView = userProfileTextView,
+                username = username,
+                password = password
+            )
+        } else {
+            userProfileTextView.text = getString(R.string.login_profile_placeholder)
+        }
+    }
+
+    /**
+     * Load saved credentials into the input fields
+     */
+    private fun loadSavedCredentials() {
         val usernameEditText = findViewById<EditText>(R.id.usernameEditText)
         val passwordEditText = findViewById<EditText>(R.id.passwordEditText)
-        val userProfileTextView = findViewById<TextView>(R.id.userProfileTextView)
-        val phoneNumbersContainer = findViewById<android.widget.LinearLayout>(R.id.phoneNumbersContainer)
-        // Auto-load saved username and password if present
-        val savedUsername = encryptedPrefs.getString("username", null)
-        val savedPassword = encryptedPrefs.getString("password", null)
-        val savedToken = encryptedPrefs.getString("token", null)
+
+        val (savedUsername, savedPassword) = SecurePrefsManager.getCredentials(this)
+
         if (!savedUsername.isNullOrEmpty()) {
             usernameEditText.setText(savedUsername)
         }
         if (!savedPassword.isNullOrEmpty()) {
             passwordEditText.setText(savedPassword)
         }
-        // Try to load user profile if token is present
-        if (!savedToken.isNullOrEmpty()) {
-            fetchUserProfile(
-                token = savedToken,
-                encryptedPrefs = encryptedPrefs,
-                userProfileTextView = userProfileTextView,
-                username = savedUsername,
-                password = savedPassword
-            )
-        } else {
-            userProfileTextView.text = getString(R.string.login_profile_placeholder)
-        }
+    }
+
+    /**
+     * Setup button click listeners
+     */
+    private fun setupButtonListeners() {
         val loginButton = findViewById<Button>(R.id.loginButton)
-        loginButton.setOnClickListener {
-            handleLoginClick(encryptedPrefs, userProfileTextView)
-        }
         val logoutButton = findViewById<Button>(R.id.logoutButton)
+        val userProfileTextView = findViewById<TextView>(R.id.userProfileTextView)
+
+        loginButton.setOnClickListener {
+            handleLoginClick(userProfileTextView)
+        }
+
         logoutButton.setOnClickListener {
-            encryptedPrefs.edit()
-                .remove("token")
-                .apply()
+            SecurePrefsManager.clearToken(this)
             userProfileTextView.text = getString(R.string.login_profile_placeholder)
         }
-        // Request phone permissions and load phone numbers
+    }
+
+    /**
+     * Check permissions and load phone numbers
+     */
+    private fun checkAndLoadPhoneNumbers() {
+        val phoneNumbersContainer = findViewById<android.widget.LinearLayout>(R.id.phoneNumbersContainer)
         checkAndLoadPhoneNumbers(phoneNumbersContainer)
     }
 
-    private fun handleLoginClick(encryptedPrefs: android.content.SharedPreferences, userProfileTextView: TextView) {
+    private fun handleLoginClick(userProfileTextView: TextView) {
         val usernameEditText = findViewById<EditText>(R.id.usernameEditText)
         val passwordEditText = findViewById<EditText>(R.id.passwordEditText)
         val username = usernameEditText.text.toString()
@@ -142,11 +148,7 @@ class SettingsActivity : AppCompatActivity() {
                     val loginResponse = try { gson.fromJson(responseBody, LoginResponse::class.java) } catch (e: Exception) { null }
                     val token = loginResponse?.token
                     // Store username, password, and token securely
-                    encryptedPrefs.edit()
-                        .putString("username", username)
-                        .putString("password", password)
-                        .putString("token", token)
-                        .apply()
+                    SecurePrefsManager.saveCredentials(this@SettingsActivity, username, password, token)
                     // Show login success popup, then fetch user profile
                     runOnUiThread {
                         AlertDialog.Builder(this@SettingsActivity)
@@ -154,7 +156,7 @@ class SettingsActivity : AppCompatActivity() {
                             .setMessage(getString(R.string.login_success))
                             .setPositiveButton("OK") { _, _ ->
                                 if (!token.isNullOrEmpty()) {
-                                    fetchUserProfile(token, encryptedPrefs, userProfileTextView, username, password)
+                                    fetchUserProfile(token, userProfileTextView, username, password)
                                 } else {
                                     userProfileTextView.text = getString(R.string.login_profile_placeholder)
                                 }
@@ -177,7 +179,6 @@ class SettingsActivity : AppCompatActivity() {
 
     private fun fetchUserProfile(
         token: String,
-        encryptedPrefs: android.content.SharedPreferences,
         userProfileTextView: TextView,
         username: String?,
         password: String?,
@@ -207,7 +208,6 @@ class SettingsActivity : AppCompatActivity() {
                     renewTokenAndRetry(
                         username = username,
                         password = password,
-                        encryptedPrefs = encryptedPrefs,
                         userProfileTextView = userProfileTextView
                     )
                 } else {
@@ -226,7 +226,6 @@ class SettingsActivity : AppCompatActivity() {
     private fun renewTokenAndRetry(
         username: String,
         password: String,
-        encryptedPrefs: android.content.SharedPreferences,
         userProfileTextView: TextView
     ) {
         val gson = Gson()
@@ -247,10 +246,10 @@ class SettingsActivity : AppCompatActivity() {
                     val loginResponse = try { gson.fromJson(responseBody, LoginResponse::class.java) } catch (e: Exception) { null }
                     val token = loginResponse?.token
                     // Store new token
-                    encryptedPrefs.edit().putString("token", token).apply()
+                    SecurePrefsManager.saveToken(this@SettingsActivity, token)
                     // Retry fetching user profile with new token, but do not retry again if it fails
                     if (!token.isNullOrEmpty()) {
-                        fetchUserProfile(token, encryptedPrefs, userProfileTextView, username, password, hasRetriedLogin = true)
+                        fetchUserProfile(token, userProfileTextView, username, password, hasRetriedLogin = true)
                     } else {
                         runOnUiThread {
                             userProfileTextView.text = getString(R.string.login_profile_placeholder)
