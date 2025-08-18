@@ -4,189 +4,185 @@ import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.os.Bundle
 import android.provider.Telephony
 import android.telephony.SmsMessage
 import android.telephony.SubscriptionManager
 import androidx.annotation.RequiresPermission
-import androidx.security.crypto.EncryptedSharedPreferences
-import androidx.security.crypto.MasterKey
-import com.google.gson.Gson
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import androidx.localbroadcastmanager.content.LocalBroadcastManager
-import org.json.JSONArray
+import com.cool2645.sms_relay.network.NetworkManager
+import com.cool2645.sms_relay.utils.SmsLogManager
+import java.text.SimpleDateFormat
+import java.util.*
 
-data class SMSRequest(
-    val phone_number: String,
-    val from: String,
-    val body: String
-)
-
+/**
+ * Broadcast receiver that handles incoming SMS messages and forwards them to the backend
+ */
 class SmsReceiver : BroadcastReceiver() {
+
     @RequiresPermission(Manifest.permission.READ_PHONE_STATE)
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action == Telephony.Sms.Intents.SMS_RECEIVED_ACTION) {
-            val bundle: Bundle? = intent.extras
-            if (bundle != null) {
-                val pdus = bundle.get("pdus") as? Array<*>
-                val format = bundle.getString("format")
-                if (pdus != null) {
-                    val messages = pdus.mapNotNull { pdu ->
-                        SmsMessage.createFromPdu(pdu as ByteArray, format)
-                    }
-                    val prefs = context.getSharedPreferences("sms_relay_prefs", Context.MODE_PRIVATE)
-                    // Try to get subscription ID from intent
-                    val subId = intent.getIntExtra("subscription", -1)
-                    val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
-                    var slotKey: String? = null
-                    var numberKey: String? = null
-                    var debugNumber: String? = null
-                    var debugSlotIndex: Int? = null
-                    if (subId != -1 && subscriptionManager != null) {
-                        val info = subscriptionManager.getActiveSubscriptionInfo(subId)
-                        val slotIndex = info?.simSlotIndex
-                        val number = info?.number
-                        debugNumber = number
-                        debugSlotIndex = slotIndex
-                        if (!number.isNullOrEmpty()) {
-                            numberKey = "sms_relay_enabled_$number"
-                        }
-                        if (slotIndex != null) {
-                            slotKey = "sms_relay_enabled_slot_$slotIndex"
-                        }
-                    }
-                    val enabled = when {
-                        !numberKey.isNullOrEmpty() && prefs.getBoolean(numberKey, false) -> true
-                        !slotKey.isNullOrEmpty() && prefs.getBoolean(slotKey, false) -> true
-                        else -> false
-                    }
-                    // Fallback: if no subId or info, show if any toggle is enabled
-                    val fallbackEnabled = prefs.all.any { it.key.startsWith("sms_relay_enabled_") && it.value == true }
-                    if ((subId != -1 && enabled) || (subId == -1 && fallbackEnabled)) {
-                        for (msg in messages) {
-                            // Compose log entry
-                            val recipient = debugNumber ?: "(unknown)"
-                            val slot = debugSlotIndex ?: -1
-                            val logLine = "From: ${msg.displayOriginatingAddress}\nTo: $recipient\nSlot: ${if (slot >= 0) slot else "(unknown)"}\n${msg.messageBody}"
-                            // Persist log entry
-                            val logPrefs = context.getSharedPreferences("sms_log", Context.MODE_PRIVATE)
-                            val logArray = JSONArray(logPrefs.getString("log", "[]"))
-                            logArray.put(0, logLine)
-                            logPrefs.edit().putString("log", logArray.toString()).apply()
-                            // Send local broadcast to MainActivity
-                            val logIntent = Intent("com.cool2645.sms_relay.SMS_LOG")
-                            logIntent.putExtra("from", msg.displayOriginatingAddress)
-                            logIntent.putExtra("body", msg.messageBody)
-                            logIntent.putExtra("recipient", recipient)
-                            logIntent.putExtra("slot", slot)
-                            LocalBroadcastManager.getInstance(context).sendBroadcast(logIntent)
-                            // Forward to backend
-                            forwardSmsToBackend(context, recipient, msg.displayOriginatingAddress, msg.messageBody)
-                        }
-                    }
-                }
-            }
+        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+
+        val smsMessages = extractSmsMessages(intent) ?: return
+        val simInfo = extractSimInfo(context, intent)
+
+        if (shouldProcessMessages(context, simInfo)) {
+            processMessages(context, smsMessages, simInfo)
         }
     }
 
-    private fun forwardSmsToBackend(context: Context, phoneNumber: String, from: String?, body: String?) {
-        val request = SMSRequest(
-            phone_number = phoneNumber,
-            from = from ?: "",
-            body = body ?: ""
-        )
-        val gson = Gson()
-        val json = gson.toJson(request)
-        val client = OkHttpClient()
-        val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
-        val requestBody = json.toRequestBody(mediaType)
-        val masterKey = MasterKey.Builder(context)
-            .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-            .build()
-        val encryptedPrefs = EncryptedSharedPreferences.create(
-            context,
-            "secure_prefs",
-            masterKey,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        )
-        val username = encryptedPrefs.getString("username", null)
-        val password = encryptedPrefs.getString("password", null)
-        fun doForward(token: String?, hasRetried: Boolean = false) {
-            if (token.isNullOrEmpty()) {
-                android.util.Log.e("SmsReceiver", "No token available for SMS forwarding.")
-                return
-            }
-            val httpRequest = Request.Builder()
-                .url("${ApiConfig.API_BASE_URL}/sms")
-                .post(requestBody)
-                .addHeader("Authorization", "Bearer $token")
-                .build()
+    /**
+     * Extract SMS messages from the intent
+     */
+    private fun extractSmsMessages(intent: Intent): List<SmsMessage>? {
+        val bundle = intent.extras ?: return null
+        val pdus = bundle.get("pdus") as? Array<*> ?: return null
+        val format = bundle.getString("format")
+
+        return pdus.mapNotNull { pdu ->
+            SmsMessage.createFromPdu(pdu as ByteArray, format)
+        }
+    }
+
+    /**
+     * Extract SIM card information from the intent
+     */
+    private fun extractSimInfo(context: Context, intent: Intent): SimInfo {
+        val subId = intent.getIntExtra("subscription", -1)
+        val subscriptionManager = context.getSystemService(Context.TELEPHONY_SUBSCRIPTION_SERVICE) as? SubscriptionManager
+
+        var number: String? = null
+        var slotIndex: Int? = null
+
+        if (subId != -1 && subscriptionManager != null) {
             try {
-                val response = client.newCall(httpRequest).execute()
-                val responseBody = response.body?.string()
-                if ((response.code == 401 || response.code == 403) && !hasRetried) {
-                    android.util.Log.w("SmsReceiver", "Token expired, attempting to renew...")
-                    val newToken = renewToken(context, username, password)
-                    if (!newToken.isNullOrEmpty()) {
-                        android.util.Log.i("SmsReceiver", "Token renewed, retrying SMS forward...")
-                        doForward(newToken, hasRetried = true)
-                    } else {
-                        android.util.Log.e("SmsReceiver", "Token renewal failed, cannot forward SMS.")
-                    }
-                } else {
-                    android.util.Log.i("SmsReceiver", "SMS forward response: ${response.code} $responseBody")
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("SmsReceiver", "SMS forward error", e)
+                val info = subscriptionManager.getActiveSubscriptionInfo(subId)
+                number = info?.number
+                slotIndex = info?.simSlotIndex
+            } catch (e: SecurityException) {
+                // Permission not granted, continue with null values
+                android.util.Log.w("SmsReceiver", "Permission not granted for subscription info")
             }
         }
+
+        return SimInfo(subId, number, slotIndex)
+    }
+
+    /**
+     * Check if messages should be processed based on SIM preferences
+     */
+    private fun shouldProcessMessages(context: Context, simInfo: SimInfo): Boolean {
+        val prefs = context.getSharedPreferences(Constants.SMS_RELAY_PREFS, Context.MODE_PRIVATE)
+
+        // Generate preference keys
+        val numberKey = if (!simInfo.number.isNullOrEmpty()) {
+            "${Constants.SMS_RELAY_ENABLED_PREFIX}${simInfo.number}"
+        } else null
+
+        val slotKey = if (simInfo.slotIndex != null) {
+            "${Constants.SMS_RELAY_ENABLED_SLOT_PREFIX}${simInfo.slotIndex}"
+        } else null
+
+        // Check if enabled for this SIM
+        val enabled = when {
+            !numberKey.isNullOrEmpty() && prefs.getBoolean(numberKey, false) -> true
+            !slotKey.isNullOrEmpty() && prefs.getBoolean(slotKey, false) -> true
+            else -> false
+        }
+
+        // Fallback: check if any relay is enabled
+        val fallbackEnabled = prefs.all.any {
+            it.key.startsWith(Constants.SMS_RELAY_ENABLED_PREFIX) && it.value == true
+        }
+
+        return (simInfo.subId != -1 && enabled) || (simInfo.subId == -1 && fallbackEnabled)
+    }
+
+    /**
+     * Process SMS messages: log and forward them
+     */
+    private fun processMessages(context: Context, messages: List<SmsMessage>, simInfo: SimInfo) {
+        for (message in messages) {
+            processSingleMessage(context, message, simInfo)
+        }
+    }
+
+    /**
+     * Process a single SMS message
+     */
+    private fun processSingleMessage(context: Context, message: SmsMessage, simInfo: SimInfo) {
+        val timestamp = SimpleDateFormat(Constants.DATE_FORMAT_PATTERN, Locale.getDefault()).format(Date())
+        val recipient = simInfo.number ?: Constants.UNKNOWN_PLACEHOLDER
+        val slot = simInfo.slotIndex ?: -1
+
+        // Create initial log entry with pending status
+        val initialLogEntry = SmsLogManager.createLogEntry(
+            from = message.displayOriginatingAddress,
+            recipient = recipient,
+            slot = slot,
+            status = Constants.STATUS_PENDING,
+            body = message.messageBody,
+            timestamp = timestamp
+        )
+
+        // Save initial log entry
+        SmsLogManager.saveLogEntry(context, initialLogEntry)
+
+        // Send initial broadcast with pending status
+        SmsLogManager.sendLogBroadcast(context, initialLogEntry)
+
+        // Forward SMS asynchronously
+        forwardSmsAsync(context, message, recipient, slot, timestamp)
+    }
+
+    /**
+     * Forward SMS to backend asynchronously and update log with result
+     */
+    private fun forwardSmsAsync(
+        context: Context,
+        message: SmsMessage,
+        recipient: String,
+        slot: Int,
+        timestamp: String
+    ) {
         Thread {
-            val token = encryptedPrefs.getString("token", null)
-            doForward(token)
+            val success = NetworkManager.forwardSmsToBackend(
+                context = context,
+                phoneNumber = recipient,
+                from = message.displayOriginatingAddress,
+                body = message.messageBody
+            )
+
+            val status = if (success) Constants.STATUS_FORWARDED else Constants.STATUS_FAILED
+
+            // Update the existing log entry's status instead of creating a new one
+            val updated = SmsLogManager.updateMostRecentLogEntryStatus(
+                context = context,
+                timestamp = timestamp,
+                from = message.displayOriginatingAddress,
+                newStatus = status
+            )
+
+            if (updated) {
+                // Send updated broadcast with final status
+                SmsLogManager.sendLogBroadcast(
+                    context = context,
+                    from = message.displayOriginatingAddress,
+                    body = message.messageBody,
+                    recipient = recipient,
+                    slot = slot,
+                    timestamp = timestamp,
+                    status = status
+                )
+            }
         }.start()
     }
 
-    private fun renewToken(context: Context, username: String?, password: String?): String? {
-        if (username.isNullOrEmpty() || password.isNullOrEmpty()) return null
-        return try {
-            val client = OkHttpClient()
-            val gson = Gson()
-            val loginRequest = mapOf("username" to username, "password" to password)
-            val json = gson.toJson(loginRequest)
-            val mediaType = "application/json; charset=utf-8".toMediaTypeOrNull()
-            val requestBody = json.toRequestBody(mediaType)
-            val httpRequest = Request.Builder()
-                .url("${ApiConfig.API_BASE_URL}/login")
-                .post(requestBody)
-                .build()
-            val response = client.newCall(httpRequest).execute()
-            val responseBody = response.body?.string()
-            if (response.isSuccessful && responseBody != null) {
-                val loginResponse = gson.fromJson(responseBody, Map::class.java)
-                val token = loginResponse["token"] as? String
-                if (!token.isNullOrEmpty()) {
-                    val masterKey = MasterKey.Builder(context)
-                        .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
-                        .build()
-                    val encryptedPrefs = EncryptedSharedPreferences.create(
-                        context,
-                        "secure_prefs",
-                        masterKey,
-                        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-                        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-                    )
-                    encryptedPrefs.edit().putString("token", token).apply()
-                    return token
-                }
-            }
-            null
-        } catch (e: Exception) {
-            android.util.Log.e("SmsReceiver", "Token renewal error", e)
-            null
-        }
-    }
+    /**
+     * Data class to hold SIM card information
+     */
+    private data class SimInfo(
+        val subId: Int,
+        val number: String?,
+        val slotIndex: Int?
+    )
 }
